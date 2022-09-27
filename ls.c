@@ -10,13 +10,13 @@
 
 // --------
 
-#define INITIAL_ENTRY_BUF_SIZE 8
+#define DISPLAY_BUF_INITIAL_NUM_BLOCKS 8
 
 // --------
 
 struct Resources {
 	DIR* directory;
-	struct dirent* entry_buffer;
+	struct dirent* display_buffer;
 };
 
 // --------
@@ -38,7 +38,9 @@ static void fail_with_usage_msg(char* const argv[]);
 static void finish_args(int argc, char* const argv[]);
 
 static DIR* open_directory(const char* dir_name);
-static void handle_entry(struct dirent* entry);
+static void close_directory(DIR* directory);
+
+static void read_entries(DIR* directory);
 
 static int gets_selected(struct dirent* entry);
 static void add_selection_filter(Selector filter);
@@ -47,8 +49,10 @@ static int no_dot_dir(struct dirent* entry);
 
 static void print_name(struct dirent* entry);
 
-static void add_to_entry_buffer(struct dirent* entry);
-static void display_entries();
+static void add_to_display_buffer(struct dirent* entry);
+static void init_display_buffer();
+static void redouble_display_buffer();
+static void display_buffered_entries();
 static int compare_entries(const void* first, const void* second);
 
 // --------
@@ -66,11 +70,11 @@ static Selector g_selection_filters[2] = {NULL, NULL};
 static size_t g_num_selection_filters = 0;
 
 static Printer g_printer = print_name;
-static Handler g_handler = add_to_entry_buffer;
+static Handler g_handler = add_to_display_buffer;
 
-static struct dirent* g_entry_buffer = NULL;
-static size_t g_entry_buffer_size = 0;
-static size_t g_num_entries = 0;
+static struct dirent* g_display_buffer = NULL;
+static size_t g_display_buffer_size = 0;
+static size_t g_num_entries_in_buffer = 0;
 
 // --------
 
@@ -78,8 +82,8 @@ static void free_resources() {
 	if(g_resources.directory != NULL) {
 		closedir(g_resources.directory);
 	}
-	if(g_resources.entry_buffer != NULL) {
-		free(g_resources.entry_buffer);
+	if(g_resources.display_buffer != NULL) {
+		free(g_resources.display_buffer);
 	}
 	return;
 }
@@ -136,6 +140,7 @@ static void finish_args(int argc, char* const argv[]) {
 	if(optind == argc - 1) {
 		g_directory_name = argv[optind];
 	}
+
 	// In case of multiple directory names, fail:
 	else if(optind < argc) {
 		fail_with_usage_msg(argv);
@@ -148,6 +153,7 @@ static void finish_args(int argc, char* const argv[]) {
 	if(opt_no_dotfiles) {
 		add_selection_filter(not_starting_with_dot);
 	}
+
 	if(opt_unordered) {
 		// No need to buffer and sort the results, just print them immediately:
 		g_handler = g_printer;
@@ -168,10 +174,27 @@ static DIR* open_directory(const char* dir_name) {
 	return directory;
 }
 
-static void handle_entry(struct dirent* entry) {
-	if(gets_selected(entry)) {
-		g_handler(entry);
+static void close_directory(DIR* directory) {
+	closedir(directory);
+	g_resources.directory = NULL;
+	return;
+}
+
+static void read_entries(DIR* directory) {
+
+	struct dirent* entry;
+
+	errno = 0;
+	entry = readdir(directory);
+
+	while(entry != NULL) {
+		if(gets_selected(entry)) {
+			g_handler(entry);
+		}
+		errno = 0;
+		entry = readdir(directory);
 	}
+
 	return;
 }
 
@@ -219,58 +242,78 @@ static void print_name(struct dirent* entry) {
 	return;
 }
 
-static void add_to_entry_buffer(struct dirent* entry) {
+static void add_to_display_buffer(struct dirent* entry) {
 
-	// If no buffer has been allocated yet:
-	if(g_entry_buffer == NULL) {
-		g_entry_buffer = calloc(INITIAL_ENTRY_BUF_SIZE, sizeof(struct dirent));
-		if(g_entry_buffer == NULL) {
-			perror("calloc");
-			free_and_exit(EXIT_FAILURE);
-		}
-		// Update buffer size:
-		g_entry_buffer_size = INITIAL_ENTRY_BUF_SIZE;
-		// Add to resources, so we remember to free it later:
-		g_resources.entry_buffer = g_entry_buffer;
+	if(g_display_buffer == NULL) {
+		init_display_buffer();
 	}
 
-	// If buffer is full, re-allocate:
-	else if(g_num_entries == g_entry_buffer_size) {
-		size_t new_buffer_size = 2 * g_entry_buffer_size;
-		// Check for overflow:
-		if(new_buffer_size <= g_entry_buffer_size) {
-			fputs("add_to_entry_buffer: overflow\n", stderr);
-			free_and_exit(EXIT_FAILURE);
-		}
-		// Re-allocate:
-		struct dirent* new_buffer = reallocarray(g_entry_buffer, new_buffer_size, sizeof(struct dirent));
-		if(new_buffer == NULL) {
-			perror("reallocarray");
-			free_and_exit(EXIT_FAILURE);
-		}
-		g_entry_buffer = new_buffer;
-		// Update buffer size:
-		g_entry_buffer_size = new_buffer_size;
-		// Update resources:
-		g_resources.entry_buffer = g_entry_buffer;
+	else if(g_num_entries_in_buffer == g_display_buffer_size) {
+		redouble_display_buffer();
 	}
 
-	// Add new entry:
-	memcpy(g_entry_buffer + g_num_entries, entry, sizeof(struct dirent));
-	g_num_entries++;
+	memcpy(g_display_buffer + g_num_entries_in_buffer, entry, sizeof(struct dirent));
+	g_num_entries_in_buffer++;
 
 	return;
 }
 
-static void display_entries() {
-	// Sort:
-	qsort(g_entry_buffer, g_num_entries, sizeof(struct dirent), compare_entries);
-	// Print:
-	if(g_entry_buffer != NULL) {
-		for(size_t i = 0; i < g_num_entries; i++)  {
-			g_printer(g_entry_buffer + i);
+static void init_display_buffer() {
+
+	g_display_buffer = calloc(DISPLAY_BUF_INITIAL_NUM_BLOCKS, sizeof(struct dirent));
+	if(g_display_buffer == NULL) {
+		perror("calloc");
+		free_and_exit(EXIT_FAILURE);
+	}
+
+	// Update buffer size:
+	g_display_buffer_size = DISPLAY_BUF_INITIAL_NUM_BLOCKS;
+
+	// Add to resources, so we remember to free it later:
+	g_resources.display_buffer = g_display_buffer;
+
+	return;
+}
+
+static void redouble_display_buffer() {
+
+	size_t new_buffer_size = 2 * g_display_buffer_size;
+	// Check for overflow:
+	if(new_buffer_size <= g_display_buffer_size) {
+		fputs("add_to_display_buffer: overflow\n", stderr);
+		free_and_exit(EXIT_FAILURE);
+	}
+
+	// Re-allocate:
+	struct dirent* new_buffer = reallocarray(g_display_buffer, new_buffer_size, sizeof(struct dirent));
+	if(new_buffer == NULL) {
+		perror("reallocarray");
+		free_and_exit(EXIT_FAILURE);
+	}
+	g_display_buffer = new_buffer;
+
+	// Update buffer size:
+	g_display_buffer_size = new_buffer_size;
+
+	// Update resources:
+	g_resources.display_buffer = g_display_buffer;
+
+	return;
+}
+
+static void display_buffered_entries() {
+
+	if(g_display_buffer != NULL) {
+
+		// Sort:
+		qsort(g_display_buffer, g_num_entries_in_buffer, sizeof(struct dirent), compare_entries);
+
+		// Print:
+		for(size_t i = 0; i < g_num_entries_in_buffer; i++)  {
+			g_printer(g_display_buffer + i);
 		}
 	}
+
 	return;
 }
 
@@ -282,29 +325,16 @@ static int compare_entries(const void* first, const void* second) {
 
 int main(int argc, char** argv) {
 
-	// Parse command-line options:
 	parse_args(argc, argv);
 
-	// Open directory:
 	DIR* directory = open_directory(g_directory_name);
 
-	// Iterate over all entries:
+	read_entries(directory);
 
-	struct dirent* entry;
+	close_directory(directory);
 
-	errno = 0;
-	entry = readdir(directory);
+	display_buffered_entries();
 
-	while(entry != NULL) {
-		handle_entry(entry);
-		errno = 0;
-		entry = readdir(directory);
-	}
-
-	// In case they weren't already printed, display:
-	display_entries();
-
-	// Free resources and exit:
 	free_and_exit(EXIT_SUCCESS);
 }
 
